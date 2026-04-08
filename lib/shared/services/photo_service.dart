@@ -40,6 +40,14 @@ class PhotoService {
       type: RequestType.image,
       hasAll: true,
       onlyAll: true,
+      filterOption: FilterOptionGroup(
+        orders: const [
+          OrderOption(
+            type: OrderOptionType.createDate,
+            asc: false, // newest first
+          ),
+        ],
+      ),
     );
     return paths.firstOrNull;
   }

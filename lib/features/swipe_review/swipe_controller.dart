@@ -1,5 +1,3 @@
-import 'dart:async';
-
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:photo_manager/photo_manager.dart';
 import 'package:photoswipe/shared/models/swipe_action.dart';
@@ -13,7 +11,9 @@ class SwipeState {
     required this.isLastPage,
     required this.loadingMore,
     required this.undoStack,
-    required this.pendingDeleteIds,
+    required this.deleteQueueIds,
+    required this.keptIds,
+    required this.replayKeeps,
   });
 
   final List<AssetEntity> assets;
@@ -21,7 +21,12 @@ class SwipeState {
   final bool isLastPage;
   final bool loadingMore;
   final List<SwipeRecord> undoStack;
-  final Set<String> pendingDeleteIds;
+  /// Ordered list (oldest first) of assets marked for deletion review.
+  final List<String> deleteQueueIds;
+  /// Assets swiped as "keep" during the current main pass, replayed only after deck ends.
+  final List<String> keptIds;
+  /// Whether we are currently replaying only kept photos.
+  final bool replayKeeps;
 
   SwipeState copyWith({
     List<AssetEntity>? assets,
@@ -29,7 +34,9 @@ class SwipeState {
     bool? isLastPage,
     bool? loadingMore,
     List<SwipeRecord>? undoStack,
-    Set<String>? pendingDeleteIds,
+    List<String>? deleteQueueIds,
+    List<String>? keptIds,
+    bool? replayKeeps,
   }) {
     return SwipeState(
       assets: assets ?? this.assets,
@@ -37,7 +44,9 @@ class SwipeState {
       isLastPage: isLastPage ?? this.isLastPage,
       loadingMore: loadingMore ?? this.loadingMore,
       undoStack: undoStack ?? this.undoStack,
-      pendingDeleteIds: pendingDeleteIds ?? this.pendingDeleteIds,
+      deleteQueueIds: deleteQueueIds ?? this.deleteQueueIds,
+      keptIds: keptIds ?? this.keptIds,
+      replayKeeps: replayKeeps ?? this.replayKeeps,
     );
   }
 }
@@ -48,79 +57,34 @@ final swipeControllerProvider = AsyncNotifierProvider<SwipeController, SwipeStat
 
 class SwipeController extends AsyncNotifier<SwipeState> {
   static const _pageSize = 60;
-  static const _deleteGracePeriod = Duration(seconds: 7);
-  static const _retryDelay = Duration(seconds: 30);
-
-  Timer? _reaper;
 
   @override
   Future<SwipeState> build() async {
-    ref.onDispose(() {
-      _reaper?.cancel();
-    });
-
     final photoService = ref.read(photoServiceProvider);
     final first = await photoService.fetchPage(page: 0, pageSize: _pageSize);
 
-    final pendingService = await ref.read(pendingDeletionServiceProvider.future);
-    final pending = pendingService.dueByAssetId;
+    final favorites = await ref.read(favoritesServiceProvider.future);
+    final favoriteIds = favorites.ids.toSet();
 
-    // Periodically check for due deletions and batch delete them.
-    _reaper ??= Timer.periodic(const Duration(seconds: 1), (_) {
-      unawaited(_reapDueDeletions());
-    });
+    final deleteQueue = await ref.read(deleteQueueServiceProvider.future);
+    final queuedIds = deleteQueue.ids;
 
     return SwipeState(
-      assets: first.assets,
+      assets: first.assets.where((a) => !favoriteIds.contains(a.id)).toList(growable: false),
       page: 0,
       isLastPage: first.isLastPage,
       loadingMore: false,
       undoStack: const [],
-      pendingDeleteIds: pending.keys.toSet(),
+      deleteQueueIds: queuedIds,
+      keptIds: const [],
+      replayKeeps: false,
     );
-  }
-
-  Future<void> _reapDueDeletions() async {
-    final pendingService = await ref.read(pendingDeletionServiceProvider.future);
-    final pending = pendingService.dueByAssetId;
-    if (pending.isEmpty) return;
-
-    final nowMs = DateTime.now().millisecondsSinceEpoch;
-    final dueIds = <String>[];
-    for (final entry in pending.entries) {
-      if (entry.value <= nowMs) {
-        dueIds.add(entry.key);
-      }
-    }
-    if (dueIds.isEmpty) return;
-
-    // iOS Photos deletion (permanent). This will trigger a system confirmation.
-    // We batch due deletions to reduce the number of prompts.
-    final failedIds = await PhotoManager.editor.deleteWithIds(dueIds);
-    final okIds = dueIds.where((id) => !failedIds.contains(id)).toList(growable: false);
-
-    // Remove successful ones from pending store + in-memory state.
-    for (final id in okIds) {
-      await pendingService.unmarkPending(id);
-    }
-
-    // Failed ones: reschedule later (avoid tight re-prompt loops).
-    if (failedIds.isNotEmpty) {
-      final dueAt = DateTime.now().add(_retryDelay);
-      for (final id in failedIds) {
-        await pendingService.markPending(assetId: id, dueAt: dueAt);
-      }
-    }
-
-    final s = state.asData?.value;
-    if (s == null) return;
-    final nextPending = {...s.pendingDeleteIds}..removeAll(okIds);
-    state = AsyncData(s.copyWith(pendingDeleteIds: nextPending));
   }
 
   Future<void> _maybeLoadMore(int currentIndex) async {
     final s = state.asData?.value;
     if (s == null) return;
+    if (s.replayKeeps) return;
     if (s.isLastPage || s.loadingMore) return;
 
     // Prefetch when near the end.
@@ -130,10 +94,15 @@ class SwipeController extends AsyncNotifier<SwipeState> {
     state = AsyncData(s.copyWith(loadingMore: true));
     state = await AsyncValue.guard(() async {
       final photoService = ref.read(photoServiceProvider);
+      final favorites = await ref.read(favoritesServiceProvider.future);
+      final favoriteIds = favorites.ids.toSet();
       final nextPage = s.page + 1;
       final next = await photoService.fetchPage(page: nextPage, pageSize: _pageSize);
       return s.copyWith(
-        assets: [...s.assets, ...next.assets],
+        assets: [
+          ...s.assets,
+          ...next.assets.where((a) => !favoriteIds.contains(a.id)),
+        ],
         page: nextPage,
         isLastPage: next.isLastPage,
         loadingMore: false,
@@ -158,9 +127,8 @@ class SwipeController extends AsyncNotifier<SwipeState> {
       case SwipeAction.keep:
         break;
       case SwipeAction.delete:
-        final dueAt = DateTime.now().add(_deleteGracePeriod);
-        final pendingService = await ref.read(pendingDeletionServiceProvider.future);
-        await pendingService.markPending(assetId: asset.id, dueAt: dueAt);
+        final deleteQueue = await ref.read(deleteQueueServiceProvider.future);
+        await deleteQueue.enqueue(asset.id);
         break;
       case SwipeAction.favorite:
         final favorites = await ref.read(favoritesServiceProvider.future);
@@ -171,13 +139,37 @@ class SwipeController extends AsyncNotifier<SwipeState> {
     state = AsyncData(
       s.copyWith(
         undoStack: [...s.undoStack, record],
-        pendingDeleteIds: action == SwipeAction.delete
-            ? {...s.pendingDeleteIds, asset.id}
-            : s.pendingDeleteIds,
+        keptIds: action == SwipeAction.keep
+            ? (s.keptIds.contains(asset.id) ? s.keptIds : [...s.keptIds, asset.id])
+            : s.keptIds,
+        deleteQueueIds: action == SwipeAction.delete
+            ? (s.deleteQueueIds.contains(asset.id) ? s.deleteQueueIds : [...s.deleteQueueIds, asset.id])
+            : s.deleteQueueIds,
       ),
     );
 
-    unawaited(_maybeLoadMore(nextIndexHint));
+    _maybeLoadMore(nextIndexHint);
+  }
+
+  Future<void> onDeckEnded() async {
+    final s = state.asData?.value;
+    if (s == null) return;
+
+    // Only replay keeps after finishing the main pass.
+    if (!s.replayKeeps && s.keptIds.isNotEmpty) {
+      final keptSet = s.keptIds.toSet();
+      final keptAssets = s.assets.where((a) => keptSet.contains(a.id)).toList(growable: false);
+      state = AsyncData(
+        s.copyWith(
+          assets: keptAssets,
+          page: 0,
+          isLastPage: true,
+          loadingMore: false,
+          keptIds: const [],
+          replayKeeps: true,
+        ),
+      );
+    }
   }
 
   Future<bool> undoLast() async {
@@ -190,8 +182,8 @@ class SwipeController extends AsyncNotifier<SwipeState> {
       case SwipeAction.keep:
         break;
       case SwipeAction.delete:
-        final pendingService = await ref.read(pendingDeletionServiceProvider.future);
-        await pendingService.unmarkPending(last.assetId);
+        final deleteQueue = await ref.read(deleteQueueServiceProvider.future);
+        await deleteQueue.dequeue(last.assetId);
         break;
       case SwipeAction.favorite:
         final favorites = await ref.read(favoritesServiceProvider.future);
@@ -202,12 +194,61 @@ class SwipeController extends AsyncNotifier<SwipeState> {
     state = AsyncData(
       s.copyWith(
         undoStack: s.undoStack.sublist(0, s.undoStack.length - 1),
-        pendingDeleteIds: last.action == SwipeAction.delete
-            ? ({...s.pendingDeleteIds}..remove(last.assetId))
-            : s.pendingDeleteIds,
+        deleteQueueIds: last.action == SwipeAction.delete
+            ? (s.deleteQueueIds.where((id) => id != last.assetId).toList(growable: false))
+            : s.deleteQueueIds,
       ),
     );
     return true;
+  }
+
+  Future<void> removeFromDeleteQueue(String assetId) async {
+    final s = state.asData?.value;
+    if (s == null) return;
+    final deleteQueue = await ref.read(deleteQueueServiceProvider.future);
+    await deleteQueue.dequeue(assetId);
+    state = AsyncData(
+      s.copyWith(
+        deleteQueueIds: s.deleteQueueIds.where((id) => id != assetId).toList(growable: false),
+      ),
+    );
+  }
+
+  Future<void> clearDeleteQueue() async {
+    final s = state.asData?.value;
+    if (s == null) return;
+    final deleteQueue = await ref.read(deleteQueueServiceProvider.future);
+    await deleteQueue.clear();
+    state = AsyncData(s.copyWith(deleteQueueIds: const []));
+  }
+
+  Future<bool> deleteQueuedFromDevice() async {
+    final s = state.asData?.value;
+    if (s == null) return false;
+
+    final deleteQueue = await ref.read(deleteQueueServiceProvider.future);
+    final idsBefore = deleteQueue.ids;
+    if (idsBefore.isEmpty) return true;
+
+    final result = await deleteQueue.deleteAllFromDevice();
+
+    // Compute deletions based on queue after operation (more reliable on iOS).
+    final remainingIds = deleteQueue.ids;
+    final remainingSet = remainingIds.toSet();
+    final deleted = idsBefore.where((id) => !remainingSet.contains(id)).toSet();
+
+    final nextAssets = s.assets.where((a) => !deleted.contains(a.id)).toList(growable: false);
+    final nextUndo = s.undoStack.where((r) => !deleted.contains(r.assetId)).toList(growable: false);
+
+    // Sync delete queue IDs with what's still pending (usually the failures).
+    state = AsyncData(
+      s.copyWith(
+        assets: nextAssets,
+        undoStack: nextUndo,
+        deleteQueueIds: remainingIds,
+      ),
+    );
+    return result.allDeleted;
   }
 }
 

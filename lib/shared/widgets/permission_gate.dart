@@ -17,7 +17,7 @@ class PermissionGate extends ConsumerWidget {
 
     return permissionAsync.when(
       loading: () => const Center(child: CupertinoActivityIndicator()),
-      error: (_, __) => const PermissionScreen(),
+      error: (e, st) => const PermissionScreen(),
       data: (state) {
         if (state.canRead) {
           return authorizedBuilder(context);

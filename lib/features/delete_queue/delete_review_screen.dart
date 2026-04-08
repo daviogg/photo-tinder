@@ -117,21 +117,22 @@ class DeleteReviewScreen extends ConsumerWidget {
 
                             if (confirmed != true) return;
 
-                            final ok = await queue.deleteAllFromDevice();
+                            final result = await queue.deleteAllFromDevice();
                             if (!context.mounted) return;
 
-                            if (!ok) {
+                            ref.invalidate(deleteQueueServiceProvider);
+
+                            if (!result.allDeleted) {
                               ScaffoldMessenger.of(context).showSnackBar(
                                 const SnackBar(
                                   content: Text(
-                                    'Deletion failed. Check photo permissions (limited/full) and try again.',
+                                    'Some items could not be deleted. Check photo permissions (limited/full) and try again.',
                                   ),
                                 ),
                               );
                               return;
                             }
 
-                            ref.invalidate(deleteQueueServiceProvider);
                             ScaffoldMessenger.of(context).showSnackBar(
                               const SnackBar(content: Text('Deleted successfully.')),
                             );
