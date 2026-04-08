@@ -6,10 +6,10 @@ It’s designed to help you quickly reduce clutter while staying in control of w
 ## Preview
 
 <p align="center">
-  <img src="assets/app_icon.png" alt="Photo Cleaner app icon" width="140" />
+  <img src="assets/app_icon.png" alt="Photo Cleaner app icon" width="120" />
+  &nbsp;&nbsp;&nbsp;&nbsp;
+  <img src="assets/screenshot.png" alt="Photo Cleaner app screenshot" width="260" />
 </p>
-
-![App screenshot](assets/screenshot.png)
 
 ## Features
 
