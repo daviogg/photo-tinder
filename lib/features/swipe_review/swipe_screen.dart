@@ -21,6 +21,7 @@ class SwipeScreen extends ConsumerStatefulWidget {
 class _SwipeScreenState extends ConsumerState<SwipeScreen> {
   late CardSwiperController _swiperController;
   late final _AppResumeObserver _resumeObserver;
+  int _topIndex = 0;
 
   @override
   void initState() {
@@ -33,6 +34,23 @@ class _SwipeScreenState extends ConsumerState<SwipeScreen> {
   void _resetSwiperController() {
     _swiperController.dispose();
     _swiperController = CardSwiperController();
+    _topIndex = 0;
+  }
+
+  Future<void> _reloadPreservingTop({String? assetId}) async {
+    await ref.read(swipeControllerProvider.notifier).reload();
+    if (!mounted) return;
+
+    final s = ref.read(swipeControllerProvider).asData?.value;
+    if (s == null || s.assets.isEmpty) return;
+
+    final targetIndex = assetId == null ? null : s.assets.indexWhere((a) => a.id == assetId);
+    if (targetIndex != null && targetIndex >= 0) {
+      _topIndex = targetIndex;
+      _swiperController.moveTo(targetIndex);
+    } else {
+      _swiperController.moveTo(_topIndex.clamp(0, s.assets.length - 1));
+    }
   }
 
   Future<void> _onAppResumed() async {
@@ -205,6 +223,10 @@ class _SwipeScreenState extends ConsumerState<SwipeScreen> {
               ),
               data: (state) {
                 if (state.assets.isEmpty) {
+                  final isLimited = permissionAsync.asData?.value.level == GalleryAccessLevel.limited;
+                  final title = isLimited
+                      ? 'No photos available'
+                      : (state.showKept ? 'No kept photos' : 'All photos reviewed');
                   return Center(
                     child: ConstrainedBox(
                       constraints: const BoxConstraints(maxWidth: 420),
@@ -234,7 +256,7 @@ class _SwipeScreenState extends ConsumerState<SwipeScreen> {
                                 ),
                                 const SizedBox(height: 12),
                                 Text(
-                                  'No photos available',
+                                  title,
                                   textAlign: TextAlign.center,
                                   style: Theme.of(context).textTheme.titleLarge?.copyWith(
                                         color: Colors.white,
@@ -243,7 +265,11 @@ class _SwipeScreenState extends ConsumerState<SwipeScreen> {
                                 ),
                                 const SizedBox(height: 8),
                                 Text(
-                                  'No photos found, or none accessible with your current permission level (Limited).',
+                                  isLimited
+                                      ? 'No photos found, or none accessible with your current permission level (Limited).'
+                                      : (state.showKept
+                                          ? 'You have no kept photos to browse.'
+                                          : 'Nothing left to review. You can now browse kept photos.'),
                                   textAlign: TextAlign.center,
                                   style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                                         color: Colors.white.withValues(alpha: 0.78),
@@ -251,52 +277,69 @@ class _SwipeScreenState extends ConsumerState<SwipeScreen> {
                                       ),
                                 ),
                                 const SizedBox(height: 14),
-                                permissionAsync.maybeWhen(
-                                  data: (p) => p.level == GalleryAccessLevel.limited
-                                      ? Column(
-                                          children: [
-                                            SizedBox(
-                                              width: double.infinity,
-                                              child: FilledButton.icon(
-                                                style: FilledButton.styleFrom(
-                                                  backgroundColor: Colors.white.withValues(alpha: 0.16),
-                                                  foregroundColor: Colors.white,
+                                if (!isLimited && !state.showKept)
+                                  SizedBox(
+                                    width: double.infinity,
+                                    child: FilledButton(
+                                      style: FilledButton.styleFrom(
+                                        backgroundColor: Colors.white.withValues(alpha: 0.16),
+                                        foregroundColor: Colors.white,
+                                      ),
+                                      onPressed: () async {
+                                        await ref.read(swipeControllerProvider.notifier).onDeckEnded();
+                                        if (!mounted) return;
+                                        setState(_resetSwiperController);
+                                      },
+                                      child: const Text('Show kept photos'),
+                                    ),
+                                  )
+                                else
+                                  permissionAsync.maybeWhen(
+                                    data: (p) => p.level == GalleryAccessLevel.limited
+                                        ? Column(
+                                            children: [
+                                              SizedBox(
+                                                width: double.infinity,
+                                                child: FilledButton.icon(
+                                                  style: FilledButton.styleFrom(
+                                                    backgroundColor: Colors.white.withValues(alpha: 0.16),
+                                                    foregroundColor: Colors.white,
+                                                  ),
+                                                  onPressed: () async {
+                                                    await ref
+                                                        .read(galleryPermissionControllerProvider.notifier)
+                                                        .manageLimitedSelection();
+                                                    if (!mounted) return;
+                                                    await _onAppResumed();
+                                                  },
+                                                  icon: const Icon(Icons.add_photo_alternate_outlined),
+                                                  label: const Text('Select more photos'),
                                                 ),
-                                                onPressed: () async {
-                                                  await ref
-                                                      .read(galleryPermissionControllerProvider.notifier)
-                                                      .manageLimitedSelection();
-                                                  if (!mounted) return;
-                                                  await _onAppResumed();
-                                                },
-                                                icon: const Icon(Icons.add_photo_alternate_outlined),
-                                                label: const Text('Select more photos'),
                                               ),
-                                            ),
-                                            const SizedBox(height: 10),
-                                            SizedBox(
-                                              width: double.infinity,
-                                              child: OutlinedButton.icon(
-                                                style: OutlinedButton.styleFrom(
-                                                  foregroundColor: Colors.white,
-                                                  side: BorderSide(color: Colors.white.withValues(alpha: 0.35)),
+                                              const SizedBox(height: 10),
+                                              SizedBox(
+                                                width: double.infinity,
+                                                child: OutlinedButton.icon(
+                                                  style: OutlinedButton.styleFrom(
+                                                    foregroundColor: Colors.white,
+                                                    side: BorderSide(color: Colors.white.withValues(alpha: 0.35)),
+                                                  ),
+                                                  onPressed: () async {
+                                                    await ref
+                                                        .read(galleryPermissionControllerProvider.notifier)
+                                                        .openSettings();
+                                                    if (!mounted) return;
+                                                    await _onAppResumed();
+                                                  },
+                                                  icon: const Icon(Icons.lock_open),
+                                                  label: const Text('Enable full access in Settings'),
                                                 ),
-                                                onPressed: () async {
-                                                  await ref
-                                                      .read(galleryPermissionControllerProvider.notifier)
-                                                      .openSettings();
-                                                  if (!mounted) return;
-                                                  await _onAppResumed();
-                                                },
-                                                icon: const Icon(Icons.lock_open),
-                                                label: const Text('Enable full access in Settings'),
                                               ),
-                                            ),
-                                          ],
-                                        )
-                                      : const SizedBox.shrink(),
-                                  orElse: () => const SizedBox.shrink(),
-                                ),
+                                            ],
+                                          )
+                                        : const SizedBox.shrink(),
+                                    orElse: () => const SizedBox.shrink(),
+                                  ),
                               ],
                             ),
                           ),
@@ -323,6 +366,14 @@ class _SwipeScreenState extends ConsumerState<SwipeScreen> {
                                 .read(swipeControllerProvider.notifier)
                                 .deleteQueuedFromDevice();
                             if (!context.mounted) return;
+                            // Keep current deck position: the controller already removes
+                            // deleted assets from memory; avoid a full reload/reset here.
+                        final current = ref.read(swipeControllerProvider).asData?.value;
+                        final topAssetId = (current != null && current.assets.isNotEmpty && _topIndex < current.assets.length)
+                            ? current.assets[_topIndex].id
+                            : null;
+                        await _reloadPreservingTop(assetId: topAssetId);
+                        if (!context.mounted) return;
                             ScaffoldMessenger.of(context).clearSnackBars();
                             ScaffoldMessenger.of(context).showSnackBar(
                               SnackBar(
@@ -350,7 +401,9 @@ class _SwipeScreenState extends ConsumerState<SwipeScreen> {
                   child: Padding(
                     padding: const EdgeInsets.all(12),
                     child: CardSwiper(
-                      key: ValueKey(state.assets.length),
+                      // Avoid resetting the deck when the list size changes (e.g. after bulk delete),
+                      // otherwise already-reviewed items can resurface from index 0.
+                      key: const ValueKey('swipe-deck'),
                       controller: _swiperController,
                       cardsCount: state.assets.length,
                       numberOfCardsDisplayed: math.min(3, state.assets.length),
@@ -370,11 +423,17 @@ class _SwipeScreenState extends ConsumerState<SwipeScreen> {
                         final action = _mapDirection(direction);
                         if (action == null) return true;
 
-                        await ref.read(swipeControllerProvider.notifier).onSwiped(
-                              swipedIndex: previousIndex,
-                              action: action,
-                              nextIndexHint: currentIndex ?? previousIndex + 1,
-                            );
+                        // CardSwiper calls `onSwipe` before its internal `_reset()` completes.
+                        // Triggering pagination here can change `cardsCount` mid-reset and cause
+                        // underlay/next-card "skips". Defer to next frame for coherence.
+                        WidgetsBinding.instance.addPostFrameCallback((_) {
+                          _topIndex = currentIndex ?? previousIndex + 1;
+                          ref.read(swipeControllerProvider.notifier).onSwiped(
+                                swipedIndex: previousIndex,
+                                action: action,
+                                nextIndexHint: currentIndex ?? previousIndex + 1,
+                              );
+                        });
                         return true;
                       },
                       cardBuilder: (context, index, percentThresholdX, percentThresholdY) {
@@ -410,12 +469,33 @@ class _SwipeScreenState extends ConsumerState<SwipeScreen> {
   }
 
   Future<void> _openDeletingZone(BuildContext context) async {
-    await showModalBottomSheet<void>(
+    final current = ref.read(swipeControllerProvider).asData?.value;
+    final topAssetId = (current != null && current.assets.isNotEmpty && _topIndex < current.assets.length)
+        ? current.assets[_topIndex].id
+        : null;
+
+    final deletedOk = await showModalBottomSheet<bool>(
       context: context,
       isScrollControlled: true,
       showDragHandle: true,
       backgroundColor: Colors.white,
       builder: (context) => const _DeletingZoneSheet(),
+    );
+
+    if (!mounted) return;
+    if (deletedOk == null) return;
+
+    await _reloadPreservingTop(assetId: topAssetId);
+    if (!mounted) return;
+    ScaffoldMessenger.of(this.context).clearSnackBars();
+    ScaffoldMessenger.of(this.context).showSnackBar(
+      SnackBar(
+        content: Text(
+          deletedOk
+              ? 'Deleted. To free iCloud space: Photos → Recently Deleted → Delete.'
+              : 'Some items could not be deleted. iCloud space: Photos → Recently Deleted → Delete.',
+        ),
+      ),
     );
   }
 
@@ -810,17 +890,7 @@ class _DeletingZoneSheet extends ConsumerWidget {
                           final deletedOk =
                               await ref.read(swipeControllerProvider.notifier).deleteQueuedFromDevice();
                           if (!context.mounted) return;
-                          Navigator.of(context).pop();
-                          ScaffoldMessenger.of(context).clearSnackBars();
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            SnackBar(
-                              content: Text(
-                                deletedOk
-                                    ? 'Deleted. To free iCloud space: Photos → Recently Deleted → Delete.'
-                                    : 'Some items could not be deleted. iCloud space: Photos → Recently Deleted → Delete.',
-                              ),
-                            ),
-                          );
+                          Navigator.of(context).pop(deletedOk);
                         },
                         child: const Text('Delete all'),
                       ),
