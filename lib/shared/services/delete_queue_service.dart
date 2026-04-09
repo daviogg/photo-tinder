@@ -67,6 +67,7 @@ class DeleteQueueService {
     if (deletedOrGone.isNotEmpty) {
       await _box.deleteAll(deletedOrGone);
     }
+    await _box.flush();
 
     return DeleteFromDeviceResult(failedIds: trulyFailedIds);
   }

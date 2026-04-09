@@ -4,6 +4,14 @@ import 'package:photoswipe/shared/models/swipe_action.dart';
 import 'package:photoswipe/shared/models/swipe_record.dart';
 import 'package:photoswipe/shared/services/service_providers.dart';
 
+/// Result of bulk delete from device + in-memory deck trim.
+class DeleteQueuedOutcome {
+  const DeleteQueuedOutcome({required this.allDeleted, required this.swiperIndex});
+  final bool allDeleted;
+  /// New top index after trimming deleted assets (also written to [SwipeState.deckTopIndex]).
+  final int swiperIndex;
+}
+
 class SwipeState {
   const SwipeState({
     required this.assets,
@@ -14,6 +22,7 @@ class SwipeState {
     required this.deleteQueueIds,
     required this.keptIds,
     required this.showKept,
+    required this.deckTopIndex,
   });
 
   final List<AssetEntity> assets;
@@ -27,6 +36,8 @@ class SwipeState {
   final List<String> keptIds;
   /// If true, show kept photos after all unreviewed are done.
   final bool showKept;
+  /// Index of the top card in [assets] (matches CardSwiper after each swipe).
+  final int deckTopIndex;
 
   SwipeState copyWith({
     List<AssetEntity>? assets,
@@ -37,6 +48,7 @@ class SwipeState {
     List<String>? deleteQueueIds,
     List<String>? keptIds,
     bool? showKept,
+    int? deckTopIndex,
   }) {
     return SwipeState(
       assets: assets ?? this.assets,
@@ -47,6 +59,7 @@ class SwipeState {
       deleteQueueIds: deleteQueueIds ?? this.deleteQueueIds,
       keptIds: keptIds ?? this.keptIds,
       showKept: showKept ?? this.showKept,
+      deckTopIndex: deckTopIndex ?? this.deckTopIndex,
     );
   }
 }
@@ -108,6 +121,7 @@ class SwipeController extends AsyncNotifier<SwipeState> {
       deleteQueueIds: queuedIds,
       keptIds: keptIds,
       showKept: showKept,
+      deckTopIndex: 0,
     );
   }
 
@@ -130,10 +144,10 @@ class SwipeController extends AsyncNotifier<SwipeState> {
     return _loadFirstPage(showKept: false);
   }
 
-  Future<void> reload() async {
+  Future<void> reload({bool force = false}) async {
     final s = state.asData?.value;
     if (s == null) return;
-    if (s.loadingMore) return;
+    if (!force && s.loadingMore) return;
 
     state = await AsyncValue.guard(() async {
       final next = await _loadFirstPage(showKept: s.showKept);
@@ -145,6 +159,7 @@ class SwipeController extends AsyncNotifier<SwipeState> {
         deleteQueueIds: next.deleteQueueIds,
         keptIds: next.keptIds,
         showKept: next.showKept,
+        deckTopIndex: 0,
       );
     });
   }
@@ -203,6 +218,13 @@ class SwipeController extends AsyncNotifier<SwipeState> {
     await _loadMore(currentIndex: currentIndex);
   }
 
+  /// Call when the CardSwiper widget is recreated at index 0 (e.g. deck ended / full reset).
+  void resetDeckCursorToZero() {
+    final s = state.asData?.value;
+    if (s == null) return;
+    state = AsyncData(s.copyWith(deckTopIndex: 0));
+  }
+
   Future<void> onSwiped({
     required int swipedIndex,
     required SwipeAction action,
@@ -214,6 +236,8 @@ class SwipeController extends AsyncNotifier<SwipeState> {
 
     final asset = s.assets[swipedIndex];
     final record = SwipeRecord(assetId: asset.id, action: action);
+    final maxI = s.assets.isEmpty ? 0 : s.assets.length - 1;
+    final nextTop = nextIndexHint.clamp(0, maxI);
 
     // Side-effects.
     switch (action) {
@@ -234,6 +258,7 @@ class SwipeController extends AsyncNotifier<SwipeState> {
     state = AsyncData(
       s.copyWith(
         undoStack: [...s.undoStack, record],
+        deckTopIndex: nextTop,
         keptIds: action == SwipeAction.keep
             ? (s.keptIds.contains(asset.id) ? s.keptIds : [...s.keptIds, asset.id])
             : s.keptIds,
@@ -268,6 +293,7 @@ class SwipeController extends AsyncNotifier<SwipeState> {
         deleteQueueIds: next.deleteQueueIds,
         keptIds: next.keptIds,
         showKept: true,
+        deckTopIndex: 0,
       );
     });
   }
@@ -295,9 +321,12 @@ class SwipeController extends AsyncNotifier<SwipeState> {
 
     // Do not mutate `assets`: the deck list stays stable; CardSwiper.undo() moves the index back.
     // Prepending here duplicated entries because swiped items were never removed from `assets`.
+    final maxI = s.assets.isEmpty ? 0 : s.assets.length - 1;
+    final prevTop = (s.deckTopIndex - 1).clamp(0, maxI);
     state = AsyncData(
       s.copyWith(
         undoStack: s.undoStack.sublist(0, s.undoStack.length - 1),
+        deckTopIndex: prevTop,
         keptIds: last.action == SwipeAction.keep
             ? (s.keptIds.where((id) => id != last.assetId).toList(growable: false))
             : s.keptIds,
@@ -329,43 +358,71 @@ class SwipeController extends AsyncNotifier<SwipeState> {
     state = AsyncData(s.copyWith(deleteQueueIds: const []));
   }
 
-  Future<bool> deleteQueuedFromDevice() async {
+  /// Removes successfully deleted assets from [SwipeState.assets] so thumbnails are not stale.
+  Future<DeleteQueuedOutcome> deleteQueuedFromDevice() async {
     final s = state.asData?.value;
-    if (s == null) return false;
+    if (s == null) {
+      return const DeleteQueuedOutcome(allDeleted: true, swiperIndex: 0);
+    }
 
     final deleteQueue = await ref.read(deleteQueueServiceProvider.future);
-    final idsBefore = deleteQueue.ids;
-    if (idsBefore.isEmpty) return true;
-
+    final idsBeforeList = List<String>.from(deleteQueue.ids);
+    if (idsBeforeList.isEmpty) {
+      final mx = s.assets.isEmpty ? 0 : s.assets.length - 1;
+      return DeleteQueuedOutcome(allDeleted: true, swiperIndex: s.deckTopIndex.clamp(0, mx));
+    }
     final result = await deleteQueue.deleteAllFromDevice();
 
-    // Compute deletions based on queue after operation (more reliable on iOS).
-    final remainingIds = deleteQueue.ids;
+    // Re-read queue from a fresh provider so UI and Hive stay in sync (avoids stale counts).
+    ref.invalidate(deleteQueueServiceProvider);
+    final syncedQueue = await ref.read(deleteQueueServiceProvider.future);
+    final remainingIds = List<String>.from(syncedQueue.ids);
     final remainingSet = remainingIds.toSet();
-    final deleted = idsBefore.where((id) => !remainingSet.contains(id)).toSet();
+    final deleted = idsBeforeList.where((id) => !remainingSet.contains(id)).toSet();
 
-    // IMPORTANT: do not mutate `assets` here.
-    //
-    // CardSwiper tracks the current card by index. Removing items from the backing list
-    // (even items that were swiped earlier) shifts indices and makes the "next/underlay"
-    // card appear to change or get skipped after bulk delete.
-    //
-    // We keep the in-memory deck stable and rely on:
-    // - `remainingIds` to reflect the queue after deletion (usually failures)
-    // - the next `reload()` (or natural pagination) to reflect the device state
+    final nextAssets = s.assets.where((a) => !deleted.contains(a.id)).toList(growable: false);
+    final swiperIndex = _swiperIndexAfterRemovingIds(
+      oldAssets: s.assets,
+      oldTopIndex: s.deckTopIndex,
+      removedIds: deleted,
+      nextAssets: nextAssets,
+    );
     final nextUndo = s.undoStack.where((r) => !deleted.contains(r.assetId)).toList(growable: false);
 
-    // Sync delete queue IDs with what's still pending (usually the failures).
     state = AsyncData(
       s.copyWith(
+        assets: nextAssets,
         undoStack: nextUndo,
         deleteQueueIds: remainingIds,
-        // Bulk-delete should never unlock kept browsing automatically.
-        // Kept appear only when the unreviewed deck ends.
         showKept: false,
+        deckTopIndex: swiperIndex,
       ),
     );
-    return result.allDeleted;
+    return DeleteQueuedOutcome(allDeleted: result.allDeleted, swiperIndex: swiperIndex);
+  }
+
+  static int _swiperIndexAfterRemovingIds({
+    required List<AssetEntity> oldAssets,
+    required int oldTopIndex,
+    required Set<String> removedIds,
+    required List<AssetEntity> nextAssets,
+  }) {
+    if (nextAssets.isEmpty) return 0;
+    final i = oldTopIndex.clamp(0, oldAssets.isEmpty ? 0 : oldAssets.length - 1);
+    final currentId = oldAssets.isEmpty ? null : oldAssets[i].id;
+
+    if (currentId != null && !removedIds.contains(currentId)) {
+      final idx = nextAssets.indexWhere((a) => a.id == currentId);
+      if (idx >= 0) return idx;
+    }
+    for (var j = i + 1; j < oldAssets.length; j++) {
+      final id = oldAssets[j].id;
+      if (!removedIds.contains(id)) {
+        final idx = nextAssets.indexWhere((a) => a.id == id);
+        if (idx >= 0) return idx;
+      }
+    }
+    return 0;
   }
 }
 

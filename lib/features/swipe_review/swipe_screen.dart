@@ -21,7 +21,8 @@ class SwipeScreen extends ConsumerStatefulWidget {
 class _SwipeScreenState extends ConsumerState<SwipeScreen> {
   late CardSwiperController _swiperController;
   late final _AppResumeObserver _resumeObserver;
-  int _topIndex = 0;
+  /// Bumps when the deck is recreated so [CardSwiper] runs `initState` with a fresh [initialIndex].
+  int _deckEpoch = 0;
 
   @override
   void initState() {
@@ -32,9 +33,20 @@ class _SwipeScreenState extends ConsumerState<SwipeScreen> {
   }
 
   void _resetSwiperController() {
+    ref.read(swipeControllerProvider.notifier).resetDeckCursorToZero();
     _swiperController.dispose();
     _swiperController = CardSwiperController();
-    _topIndex = 0;
+    _deckEpoch++;
+  }
+
+  /// After bulk delete, recreate swiper so `initialIndex` matches [SwipeState.deckTopIndex].
+  void _syncSwiperAfterBulkDelete() {
+    if (!mounted) return;
+    setState(() {
+      _swiperController.dispose();
+      _swiperController = CardSwiperController();
+      _deckEpoch++;
+    });
   }
 
   Future<void> _onAppResumed() async {
@@ -43,7 +55,7 @@ class _SwipeScreenState extends ConsumerState<SwipeScreen> {
     await ref.read(galleryPermissionControllerProvider.notifier).refresh();
     if (!mounted) return;
     setState(_resetSwiperController);
-    await ref.read(swipeControllerProvider.notifier).reload();
+    await ref.read(swipeControllerProvider.notifier).reload(force: true);
   }
 
   @override
@@ -66,7 +78,7 @@ class _SwipeScreenState extends ConsumerState<SwipeScreen> {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted) return;
         setState(_resetSwiperController);
-        ref.read(swipeControllerProvider.notifier).reload();
+        ref.read(swipeControllerProvider.notifier).reload(force: true);
       });
     });
 
@@ -114,12 +126,6 @@ class _SwipeScreenState extends ConsumerState<SwipeScreen> {
               final ok = await ref.read(swipeControllerProvider.notifier).undoLast();
               if (!ok || !mounted) return;
               _swiperController.undo();
-              final len = ref.read(swipeControllerProvider).asData?.value.assets.length ?? 0;
-              if (len > 0) {
-                setState(() {
-                  _topIndex = (_topIndex - 1).clamp(0, len - 1);
-                });
-              }
             },
             icon: const Icon(Icons.undo),
           ),
@@ -351,15 +357,17 @@ class _SwipeScreenState extends ConsumerState<SwipeScreen> {
                         : () async {
                             final ok = await _confirmDeleteAll(context, count: state.deleteQueueIds.length);
                             if (!ok) return;
-                            final deletedOk = await ref
+                            final outcome = await ref
                                 .read(swipeControllerProvider.notifier)
                                 .deleteQueuedFromDevice();
+                            if (!context.mounted) return;
+                            _syncSwiperAfterBulkDelete();
                             if (!context.mounted) return;
                             ScaffoldMessenger.of(context).clearSnackBars();
                             ScaffoldMessenger.of(context).showSnackBar(
                               SnackBar(
                                 content: Text(
-                                  deletedOk
+                                  outcome.allDeleted
                                       ? 'Deleted. To free iCloud space: Photos → Recently Deleted → Delete.'
                                       : 'Some items could not be deleted. iCloud space: Photos → Recently Deleted → Delete.',
                                 ),
@@ -382,10 +390,11 @@ class _SwipeScreenState extends ConsumerState<SwipeScreen> {
                   child: Padding(
                     padding: const EdgeInsets.all(12),
                     child: CardSwiper(
-                      // Avoid resetting the deck when the list size changes (e.g. after bulk delete),
-                      // otherwise already-reviewed items can resurface from index 0.
-                      key: const ValueKey('swipe-deck'),
+                      key: ValueKey(_deckEpoch),
                       controller: _swiperController,
+                      initialIndex: state.assets.isEmpty
+                          ? 0
+                          : state.deckTopIndex.clamp(0, state.assets.length - 1),
                       cardsCount: state.assets.length,
                       numberOfCardsDisplayed: math.min(3, state.assets.length),
                       isLoop: false,
@@ -408,7 +417,6 @@ class _SwipeScreenState extends ConsumerState<SwipeScreen> {
                         // Triggering pagination here can change `cardsCount` mid-reset and cause
                         // underlay/next-card "skips". Defer to next frame for coherence.
                         WidgetsBinding.instance.addPostFrameCallback((_) {
-                          _topIndex = currentIndex ?? previousIndex + 1;
                           ref.read(swipeControllerProvider.notifier).onSwiped(
                                 swipedIndex: previousIndex,
                                 action: action,
@@ -450,7 +458,7 @@ class _SwipeScreenState extends ConsumerState<SwipeScreen> {
   }
 
   Future<void> _openDeletingZone(BuildContext context) async {
-    final deletedOk = await showModalBottomSheet<bool>(
+    final outcome = await showModalBottomSheet<DeleteQueuedOutcome?>(
       context: context,
       isScrollControlled: true,
       showDragHandle: true,
@@ -459,13 +467,15 @@ class _SwipeScreenState extends ConsumerState<SwipeScreen> {
     );
 
     if (!mounted) return;
-    if (deletedOk == null) return;
+    if (outcome == null) return;
 
+    _syncSwiperAfterBulkDelete();
+    if (!mounted) return;
     ScaffoldMessenger.of(this.context).clearSnackBars();
     ScaffoldMessenger.of(this.context).showSnackBar(
       SnackBar(
         content: Text(
-          deletedOk
+          outcome.allDeleted
               ? 'Deleted. To free iCloud space: Photos → Recently Deleted → Delete.'
               : 'Some items could not be deleted. iCloud space: Photos → Recently Deleted → Delete.',
         ),
@@ -861,10 +871,11 @@ class _DeletingZoneSheet extends ConsumerWidget {
                           );
                           if (ok != true) return;
 
-                          final deletedOk =
-                              await ref.read(swipeControllerProvider.notifier).deleteQueuedFromDevice();
+                          final outcome = await ref
+                              .read(swipeControllerProvider.notifier)
+                              .deleteQueuedFromDevice();
                           if (!context.mounted) return;
-                          Navigator.of(context).pop(deletedOk);
+                          Navigator.of(context).pop(outcome);
                         },
                         child: const Text('Delete all'),
                       ),
